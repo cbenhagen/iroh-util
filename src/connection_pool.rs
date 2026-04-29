@@ -13,24 +13,25 @@ use std::{
     io,
     ops::Deref,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
 };
 
 use iroh::{
-    endpoint::{ConnectError, Connection},
     Endpoint, EndpointId,
+    endpoint::{ConnectError, Connection},
 };
 use n0_error::{e, stack_error};
 use n0_future::{
+    FuturesUnordered, MaybeFuture, Stream, StreamExt,
     future::{self},
     time::Duration,
-    FuturesUnordered, MaybeFuture, Stream, StreamExt,
 };
 use tokio::sync::{
+    Notify,
     mpsc::{self, error::SendError as TokioSendError},
-    oneshot, Notify,
+    oneshot,
 };
 use tracing::{debug, error, info, trace};
 
@@ -546,13 +547,13 @@ mod tests {
     use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
     use iroh::{
-        address_lookup::MemoryLookup,
-        endpoint::{presets, Connection},
-        protocol::{AcceptError, ProtocolHandler, Router},
         EndpointAddr, EndpointId, RelayMode, SecretKey, TransportAddr, Watcher,
+        address_lookup::MemoryLookup,
+        endpoint::{Connection, presets},
+        protocol::{AcceptError, ProtocolHandler, Router},
     };
     use n0_error::{AnyError, Result, StdResultExt};
-    use n0_future::{io, stream, BufferedStreamExt, StreamExt};
+    use n0_future::{BufferedStreamExt, StreamExt, io, stream};
     use testresult::TestResult;
     use tracing::trace;
 
