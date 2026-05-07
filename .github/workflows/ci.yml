@@ -50,3 +50,26 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check MSRV
         run: cargo +$MSRV check --workspace --all-targets
+
+  minimal-versions:
+    name: Minimal Direct Dependency Versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Resolve direct deps to minimum versions
+        run: cargo +nightly -Z direct-minimal-versions update
+      - name: Check lib at minimum versions
+        run: cargo check --lib --locked
+
+  cargo-deny:
+    name: Cargo Deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --workspace --all-features
+          command-arguments: "-Dwarnings"

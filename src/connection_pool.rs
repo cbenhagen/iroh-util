@@ -547,7 +547,7 @@ mod tests {
     use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
     use iroh::{
-        EndpointAddr, EndpointId, RelayMode, SecretKey, TransportAddr, Watcher,
+        EndpointAddr, EndpointId, RelayMode, SecretKey, TransportAddr,
         address_lookup::MemoryLookup,
         endpoint::{Connection, presets},
         protocol::{AcceptError, ProtocolHandler, Router},
@@ -812,8 +812,7 @@ mod tests {
             .bind()
             .await?;
         let on_connected = |_, conn: Connection| async move {
-            let paths = conn.paths();
-            let mut stream = paths.stream();
+            let mut stream = conn.paths_stream();
             while let Some(paths) = stream.next().await {
                 if paths.iter().any(|path| path.is_ip()) {
                     return Ok(());
