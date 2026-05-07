@@ -10,7 +10,7 @@ documentation = "https://docs.rs/iroh-util"
 keywords = ["iroh", "p2p", "quic", "connection-pool"]
 categories = ["network-programming"]
 readme = "README.md"
-rust-version = "1.89"
+rust-version = "1.91"
 exclude = [
     "Cargo.toml.orig",
     ".github",

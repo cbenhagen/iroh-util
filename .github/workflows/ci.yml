@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 env:
-  MSRV: "1.89"
+  MSRV: "1.91"
 
 jobs:
   ci:
