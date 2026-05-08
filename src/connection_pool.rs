@@ -23,11 +23,7 @@ use iroh::{
     endpoint::{ConnectError, Connection},
 };
 use n0_error::{e, stack_error};
-use n0_future::{
-    FuturesUnordered, MaybeFuture, Stream, StreamExt,
-    future::{self},
-    time::Duration,
-};
+use n0_future::{MaybeFuture, Stream, StreamExt, task::AbortOnDropHandle, time::Duration};
 use tokio::sync::{
     Notify,
     mpsc::{self, error::SendError as TokioSendError},
@@ -37,6 +33,16 @@ use tracing::{debug, error, info, trace};
 
 pub type OnConnected =
     Arc<dyn Fn(&Endpoint, &Connection) -> n0_future::future::Boxed<io::Result<()>> + Send + Sync>;
+
+/// Capacity of the per-`EndpointId` inbox between the pool main loop and a
+/// connection actor. The bug this module's regression test guards against
+/// pivots on this constant: concurrent dispatch to one peer beyond this
+/// many requests will cause `Actor::handle_msg`'s `conn_tx.send().await`
+/// to block (the pool main loop's head-of-line stall), bounded by one
+/// `connect_timeout` window. The test scales its concurrency relative to
+/// this constant so the regression keeps testing what it claims to if
+/// the value is ever changed.
+const PER_CONNECTION_INBOX: usize = 100;
 
 /// Configuration options for the connection pool
 #[derive(derive_more::Debug, Clone)]
@@ -197,28 +203,40 @@ impl Context {
             }
         };
 
-        // Connect to the node
         let state = n0_future::time::timeout(context.options.connect_timeout, conn_fut)
             .await
             .map_err(|_| e!(PoolConnectError::Timeout))
             .and_then(|r| r);
-        let conn_close = match &state {
-            Ok(conn) => {
-                let conn = conn.clone();
-                MaybeFuture::Some(async move { conn.closed().await })
-            }
-            Err(e) => {
-                debug!(%node_id, "Failed to connect {e:?}, requesting shutdown");
-                if context.owner.close(node_id).await.is_err() {
-                    return;
+
+        // On connect failure: stop accepting new requests, drain any
+        // already-buffered ones with the cause, then exit. Closing rx
+        // *before* draining avoids a race where a sender lands in the
+        // buffer between our last try_recv and channel teardown — those
+        // requests would otherwise see a bare `oneshot::Closed` instead
+        // of the actual error.
+        let connection = match state {
+            Ok(conn) => conn,
+            Err(cause) => {
+                debug!(%node_id, "Failed to connect {cause:?}");
+                rx.close();
+                while let Ok(RequestRef { tx, .. }) = rx.try_recv() {
+                    let _ = tx.send(Err(cause.clone()));
                 }
-                MaybeFuture::None
+                let _ = context
+                    .owner
+                    .tx
+                    .try_send(ActorMessage::ConnectionShutdown { id: node_id });
+                return;
             }
         };
 
         let counter = ConnectionCounter::new();
         let idle_timer = MaybeFuture::default();
         let idle_stream = counter.clone().idle_stream();
+        let conn_close = {
+            let conn = connection.clone();
+            async move { conn.closed().await }
+        };
 
         tokio::pin!(idle_timer, idle_stream, conn_close);
 
@@ -226,78 +244,67 @@ impl Context {
             tokio::select! {
                 biased;
 
-                // Handle new work
                 handler = rx.recv() => {
                     match handler {
                         Some(RequestRef { id, tx }) => {
                             assert!(id == node_id, "Not for me!");
-                            match &state {
-                                Ok(state) => {
-                                    let res = ConnectionRef::new(state.clone(), counter.get_one());
-                                    info!(%node_id, "Handing out ConnectionRef {}", counter.current());
-
-                                    // clear the idle timer
-                                    idle_timer.as_mut().set_none();
-                                    tx.send(Ok(res)).ok();
-                                }
-                                Err(cause) => {
-                                    tx.send(Err(cause.clone())).ok();
-                                }
-                            }
+                            let res = ConnectionRef::new(connection.clone(), counter.get_one());
+                            info!(%node_id, "Handing out ConnectionRef {}", counter.current());
+                            idle_timer.as_mut().set_none();
+                            tx.send(Ok(res)).ok();
                         }
-                        None => {
-                            // Channel closed - exit
-                            break;
-                        }
+                        None => break,
                     }
                 }
 
-                _ = &mut conn_close => {
-                    // connection was closed by somebody, notify owner that we should be removed
-                    context.owner.close(node_id).await.ok();
-                }
+                _ = &mut conn_close => break,
 
                 _ = idle_stream.next() => {
                     if !counter.is_idle() {
                         continue;
                     };
-                    // notify the pool that we are idle.
                     trace!(%node_id, "Idle");
-                    if context.owner.idle(node_id).await.is_err() {
-                        // If we can't notify the pool, we are shutting down
-                        break;
-                    }
-                    // set the idle timer
-                    idle_timer.as_mut().set_future(n0_future::time::sleep(context.options.idle_timeout));
+                    context.owner.try_idle(node_id);
+                    idle_timer
+                        .as_mut()
+                        .set_future(n0_future::time::sleep(context.options.idle_timeout));
                 }
 
-                // Idle timeout - request shutdown
                 _ = &mut idle_timer => {
-                    trace!(%node_id, "Idle timer expired, requesting shutdown");
-                    context.owner.close(node_id).await.ok();
-                    // Don't break here - wait for main actor to close our channel
+                    trace!(%node_id, "Idle timer expired, exiting");
+                    break;
                 }
             }
         }
 
-        if let Ok(connection) = state {
-            let reason = if counter.is_idle() { b"idle" } else { b"drop" };
-            connection.close(0u32.into(), reason);
-        }
+        let reason = if counter.is_idle() { b"idle" } else { b"drop" };
+        connection.close(0u32.into(), reason);
+        // Best-effort eager cleanup; the pool also detects our exit lazily
+        // via Err on the next conn_tx.send, so a dropped notification is
+        // not a correctness issue.
+        let _ = context
+            .owner
+            .tx
+            .try_send(ActorMessage::ConnectionShutdown { id: node_id });
 
         trace!(%node_id, "Connection actor shutting down");
     }
 }
 
+/// One per-connection-actor entry held by the pool's main loop.
+struct ConnectionEntry {
+    tx: mpsc::Sender<RequestRef>,
+    /// Held for `AbortOnDropHandle` drop semantics — never read.
+    _task: AbortOnDropHandle<()>,
+}
+
 struct Actor {
     rx: mpsc::Receiver<ActorMessage>,
-    connections: HashMap<EndpointId, mpsc::Sender<RequestRef>>,
+    connections: HashMap<EndpointId, ConnectionEntry>,
     context: Arc<Context>,
     // idle set (most recent last)
     // todo: use a better data structure if this becomes a performance issue
     idle: VecDeque<EndpointId>,
-    // per connection tasks
-    tasks: FuturesUnordered<future::Boxed<()>>,
 }
 
 impl Actor {
@@ -318,7 +325,6 @@ impl Actor {
                     endpoint,
                     owner: ConnectionPool { tx: tx.clone() },
                 }),
-                tasks: FuturesUnordered::new(),
             },
             tx,
         )
@@ -348,8 +354,8 @@ impl Actor {
                 let id = msg.id;
                 self.remove_idle(id);
                 // Try to send to existing connection actor
-                if let Some(conn_tx) = self.connections.get(&id) {
-                    if let Err(TokioSendError(e)) = conn_tx.send(msg).await {
+                if let Some(entry) = self.connections.get(&id) {
+                    if let Err(TokioSendError(e)) = entry.tx.send(msg).await {
                         msg = e;
                     } else {
                         return;
@@ -358,26 +364,54 @@ impl Actor {
                     self.remove_connection(id);
                 }
 
-                // No connection actor or it died - check limits
+                // No connection actor or it died - check limits.
+                //
+                // We reap closed entries here (cap-check) but not on every
+                // dispatch: that bounds the cost to O(connections) per
+                // capacity miss instead of per RequestRef. Below the cap
+                // a stale entry survives until the next request for the
+                // same id (which fails fast on `conn_tx.send` and removes
+                // it). `connections.len()` therefore inflates by stale
+                // entries below the cap; if a future caller needs a
+                // truthful count for metrics, reaping should move higher
+                // up in `handle_msg`.
                 if self.connections.len() >= self.context.options.max_connections {
-                    if let Some(idle) = self.pop_oldest_idle() {
-                        // remove the oldest idle connection to make room for one more
-                        trace!("removing oldest idle connection {}", idle);
-                        self.connections.remove(&idle);
-                    } else {
-                        msg.tx
-                            .send(Err(e!(PoolConnectError::TooManyConnections)))
-                            .ok();
-                        return;
+                    self.connections.retain(|id, entry| {
+                        if entry.tx.is_closed() {
+                            self.idle.retain(|x| x != id);
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    if self.connections.len() >= self.context.options.max_connections {
+                        if let Some(idle) = self.pop_oldest_idle() {
+                            // remove the oldest idle connection to make room for one more
+                            trace!("removing oldest idle connection {}", idle);
+                            self.connections.remove(&idle);
+                        } else {
+                            msg.tx
+                                .send(Err(e!(PoolConnectError::TooManyConnections)))
+                                .ok();
+                            return;
+                        }
                     }
                 }
-                let (conn_tx, conn_rx) = mpsc::channel(100);
-                self.connections.insert(id, conn_tx.clone());
-
+                let (conn_tx, conn_rx) = mpsc::channel(PER_CONNECTION_INBOX);
                 let context = self.context.clone();
-
-                self.tasks
-                    .push(Box::pin(context.run_connection_actor(id, conn_rx)));
+                // Connection actors run on their own task so their
+                // `endpoint.connect`/`connect_timeout` make progress
+                // independently of the pool main loop.
+                let task = AbortOnDropHandle::new(n0_future::task::spawn(
+                    context.run_connection_actor(id, conn_rx),
+                ));
+                self.connections.insert(
+                    id,
+                    ConnectionEntry {
+                        tx: conn_tx.clone(),
+                        _task: task,
+                    },
+                );
 
                 // Send the handler to the new actor
                 if conn_tx.send(msg).await.is_err() {
@@ -398,20 +432,8 @@ impl Actor {
     }
 
     pub async fn run(mut self) {
-        loop {
-            tokio::select! {
-                biased;
-
-                msg = self.rx.recv() => {
-                    if let Some(msg) = msg {
-                        self.handle_msg(msg).await;
-                    } else {
-                        break;
-                    }
-                }
-
-                _ = self.tasks.next(), if !self.tasks.is_empty() => {}
-            }
+        while let Some(msg) = self.rx.recv().await {
+            self.handle_msg(msg).await;
         }
     }
 }
@@ -460,18 +482,12 @@ impl ConnectionPool {
         Ok(())
     }
 
-    /// Notify the connection pool that a connection is idle.
-    ///
-    /// Should only be called from connection handlers.
-    pub(crate) async fn idle(
-        &self,
-        id: EndpointId,
-    ) -> std::result::Result<(), ConnectionPoolError> {
-        self.tx
-            .send(ActorMessage::ConnectionIdle { id })
-            .await
-            .map_err(|_| e!(ConnectionPoolError::Shutdown))?;
-        Ok(())
+    /// Best-effort idle notification (LRU tracking). Cannot await on the
+    /// pool inbox: that would deadlock against the pool's own
+    /// `conn_tx.send().await` dispatch when the per-connection inbox is
+    /// full. Dropped notifications only stale the LRU order.
+    pub(crate) fn try_idle(&self, id: EndpointId) {
+        let _ = self.tx.try_send(ActorMessage::ConnectionIdle { id });
     }
 }
 
@@ -830,6 +846,168 @@ mod tests {
         for id in &ids {
             let res = client.echo(*id, msg.clone()).await;
             assert!(res.is_ok());
+        }
+        shutdown_routers(routers).await;
+        endpoint.close().await;
+        Ok(())
+    }
+
+    /// Bind a UDP socket to a free loopback port and keep it alive for the
+    /// caller's lifetime. iroh `connect()` against this address will time
+    /// out (no QUIC handshake response), avoiding both hardcoded ports
+    /// (which can clash) and unbound ones (which OSes may rebind).
+    fn dead_addr() -> TestResult<(std::net::UdpSocket, TransportAddr)> {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let addr = TransportAddr::Ip(sock.local_addr()?);
+        Ok((sock, addr))
+    }
+
+    /// Spawn `n` concurrent `get_or_connect(id)` calls and yield until
+    /// each task has at least entered its body (counter increment).
+    ///
+    /// The increment runs *before* `pool.get_or_connect(id).await`, so
+    /// strictly speaking this only proves all `n` tasks are executing,
+    /// not that they have all reached `pool.tx.send().await`. On the
+    /// cooperative current-thread runtime these tests use, the resume
+    /// after the final `yield_now` does in practice run every spawned
+    /// task to its first await — but that is a runtime property, not a
+    /// guarantee of this helper.
+    async fn enter_get_or_connect(
+        pool: ConnectionPool,
+        id: EndpointId,
+        n: usize,
+    ) -> Vec<
+        tokio::task::JoinHandle<std::result::Result<super::ConnectionRef, super::PoolConnectError>>,
+    > {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let started = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::with_capacity(n);
+        for _ in 0..n {
+            let pool = pool.clone();
+            let started = started.clone();
+            handles.push(tokio::spawn(async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                pool.get_or_connect(id).await
+            }));
+        }
+        while started.load(Ordering::SeqCst) < n {
+            tokio::task::yield_now().await;
+        }
+        handles
+    }
+
+    /// Regression for a deadlock between the pool main loop and a
+    /// per-connection actor when concurrent requests for one slow-to-
+    /// connect peer overflow the per-connection inbox: the pool blocked
+    /// on `conn_tx.send().await` while the actor's error path blocked on
+    /// `owner.close().await` into the also-full pool main inbox. Probe
+    /// against an unrelated reachable peer must complete in bounded time.
+    #[tokio::test]
+    async fn connection_pool_dead_peer_backlog_does_not_wedge() -> TestResult<()> {
+        use std::time::Instant;
+
+        let (live_ids, routers, address_lookup) = echo_servers(1).await?;
+        let live_peer = live_ids[0];
+
+        let (_dead_sock, dead_transport_addr) = dead_addr()?;
+        let dead_peer = SecretKey::from_bytes(&[7; 32]).public();
+        address_lookup.add_endpoint_info(EndpointAddr {
+            id: dead_peer,
+            addrs: vec![dead_transport_addr].into_iter().collect(),
+        });
+
+        let endpoint = iroh::Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Default)
+            .address_lookup(address_lookup)
+            .bind()
+            .await?;
+
+        let connect_timeout = Duration::from_secs(1);
+        let pool = ConnectionPool::new(
+            endpoint.clone(),
+            ECHO_ALPN,
+            Options {
+                connect_timeout,
+                ..test_options()
+            },
+        );
+
+        // Concurrency above the per-connection inbox capacity is what
+        // forces the dispatch wedge.
+        let backlog =
+            enter_get_or_connect(pool.clone(), dead_peer, super::PER_CONNECTION_INBOX + 50).await;
+
+        // With the fix the probe completes in ~one connect_timeout
+        // window; without the fix it hangs. 5x leaves slack for a loaded
+        // CI runner without delaying the regression failure.
+        let probe_budget = connect_timeout * 5;
+        let probe = Instant::now();
+        let probe_result =
+            n0_future::time::timeout(probe_budget, pool.get_or_connect(live_peer)).await;
+        let elapsed = probe.elapsed();
+
+        for h in backlog {
+            h.abort();
+        }
+        shutdown_routers(routers).await;
+        endpoint.close().await;
+
+        match probe_result {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => panic!("live-peer probe errored after {elapsed:?}: {e:?}"),
+            Err(_) => {
+                panic!("live-peer probe did not complete within {probe_budget:?} — pool wedged")
+            }
+        }
+    }
+
+    /// Boundary check for `connection_pool_dead_peer_backlog_does_not_wedge`:
+    /// concurrency below the per-connection inbox capacity does not trigger
+    /// the wedge, so the unrelated-peer probe must complete within one
+    /// `connect_timeout` window.
+    #[tokio::test]
+    async fn connection_pool_dead_peer_below_inbox_cap_is_unaffected() -> TestResult<()> {
+        use std::time::Instant;
+
+        let (live_ids, routers, address_lookup) = echo_servers(1).await?;
+        let live_peer = live_ids[0];
+
+        let (_dead_sock, dead_transport_addr) = dead_addr()?;
+        let dead_peer = SecretKey::from_bytes(&[8; 32]).public();
+        address_lookup.add_endpoint_info(EndpointAddr {
+            id: dead_peer,
+            addrs: vec![dead_transport_addr].into_iter().collect(),
+        });
+
+        let endpoint = iroh::Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Default)
+            .address_lookup(address_lookup)
+            .bind()
+            .await?;
+        let connect_timeout = Duration::from_secs(1);
+        let pool = ConnectionPool::new(
+            endpoint.clone(),
+            ECHO_ALPN,
+            Options {
+                connect_timeout,
+                ..test_options()
+            },
+        );
+
+        let backlog =
+            enter_get_or_connect(pool.clone(), dead_peer, super::PER_CONNECTION_INBOX / 2).await;
+
+        let probe = Instant::now();
+        let res = pool.get_or_connect(live_peer).await;
+        let elapsed = probe.elapsed();
+        assert!(res.is_ok(), "live-peer connect failed: {res:?}");
+        assert!(
+            elapsed < connect_timeout,
+            "live-peer probe took {elapsed:?} below inbox cap"
+        );
+
+        for h in backlog {
+            h.abort();
         }
         shutdown_routers(routers).await;
         endpoint.close().await;
