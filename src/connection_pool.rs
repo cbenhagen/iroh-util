@@ -8,6 +8,8 @@
 //!
 //! It is important that you keep the [`ConnectionRef`] alive while you are using
 //! the connection.
+//!
+//! This is using a single actor to manage all connections.
 use std::{
     collections::{HashMap, VecDeque},
     io,
@@ -16,6 +18,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Instant,
 };
 
 use iroh::{
@@ -23,31 +26,23 @@ use iroh::{
     endpoint::{ConnectError, Connection},
 };
 use n0_error::{e, stack_error};
-use n0_future::{MaybeFuture, Stream, StreamExt, task::AbortOnDropHandle, time::Duration};
-use tokio::sync::{
-    Notify,
-    mpsc::{self, error::SendError as TokioSendError},
-    oneshot,
-};
-use tracing::{debug, error, info, trace};
+use n0_future::{FuturesUnordered, StreamExt, future::Boxed, time::Duration};
+use tokio::sync::{mpsc, oneshot};
+use tracing::{debug, info, trace};
 
 pub type OnConnected =
     Arc<dyn Fn(&Endpoint, &Connection) -> n0_future::future::Boxed<io::Result<()>> + Send + Sync>;
 
-/// Capacity of the per-`EndpointId` inbox between the pool main loop and a
-/// connection actor. The bug this module's regression test guards against
-/// pivots on this constant: concurrent dispatch to one peer beyond this
-/// many requests will cause `Actor::handle_msg`'s `conn_tx.send().await`
-/// to block (the pool main loop's head-of-line stall), bounded by one
-/// `connect_timeout` window. The test scales its concurrency relative to
-/// this constant so the regression keeps testing what it claims to if
-/// the value is ever changed.
-const PER_CONNECTION_INBOX: usize = 100;
+/// We now have just a single actor, so we can afford a larger inbox.
+const INBOX_CAPACITY: usize = 1024;
 
 /// Configuration options for the connection pool
 #[derive(derive_more::Debug, Clone)]
 pub struct Options {
-    /// How long to keep idle connections around.
+    /// How long to keep unused connections around.
+    ///
+    /// Idle here means that there are no [`ConnectionRef`]s alive for the connection,
+    /// not that the connection itself is idle.
     pub idle_timeout: Duration,
     /// Timeout for connect. This includes the time spent in on_connect, if set.
     pub connect_timeout: Duration,
@@ -162,7 +157,6 @@ pub enum ConnectionPoolError {
 
 enum ActorMessage {
     RequestRef(RequestRef),
-    ConnectionIdle { id: EndpointId },
     ConnectionShutdown { id: EndpointId },
 }
 
@@ -171,269 +165,363 @@ struct RequestRef {
     tx: oneshot::Sender<Result<ConnectionRef, PoolConnectError>>,
 }
 
-struct Context {
-    options: Options,
-    endpoint: Endpoint,
-    owner: ConnectionPool,
-    alpn: Vec<u8>,
+/// State for a peer in the connection pool
+enum PeerState {
+    /// We are currently connecting to this peer.
+    Connecting {
+        generation: u64,
+        /// Waiters that need to be notified when the connection is established or fails.
+        waiters: Vec<oneshot::Sender<Result<ConnectionRef, PoolConnectError>>>,
+    },
+    /// We have a connection to the peer.
+    Ready {
+        connection: Connection,
+        counter: ConnectionCounter,
+        unused_since: Option<Instant>,
+    },
 }
 
-impl Context {
-    async fn run_connection_actor(
-        self: Arc<Self>,
-        node_id: EndpointId,
-        mut rx: mpsc::Receiver<RequestRef>,
-    ) {
-        let context = self;
-
-        let conn_fut = {
-            let context = context.clone();
-            async move {
-                let conn = context
-                    .endpoint
-                    .connect(node_id, &context.alpn)
-                    .await
-                    .map_err(PoolConnectError::from)?;
-                if let Some(on_connect) = &context.options.on_connected {
-                    on_connect(&context.endpoint, &conn)
-                        .await
-                        .map_err(PoolConnectError::from)?;
-                }
-                Result::<Connection, PoolConnectError>::Ok(conn)
-            }
-        };
-
-        let state = n0_future::time::timeout(context.options.connect_timeout, conn_fut)
-            .await
-            .map_err(|_| e!(PoolConnectError::Timeout))
-            .and_then(|r| r);
-
-        // On connect failure: stop accepting new requests, drain any
-        // already-buffered ones with the cause, then exit. Closing rx
-        // *before* draining avoids a race where a sender lands in the
-        // buffer between our last try_recv and channel teardown — those
-        // requests would otherwise see a bare `oneshot::Closed` instead
-        // of the actual error.
-        let connection = match state {
-            Ok(conn) => conn,
-            Err(cause) => {
-                debug!(%node_id, "Failed to connect {cause:?}");
-                rx.close();
-                while let Ok(RequestRef { tx, .. }) = rx.try_recv() {
-                    let _ = tx.send(Err(cause.clone()));
-                }
-                let _ = context
-                    .owner
-                    .tx
-                    .try_send(ActorMessage::ConnectionShutdown { id: node_id });
-                return;
-            }
-        };
-
-        let counter = ConnectionCounter::new();
-        let idle_timer = MaybeFuture::default();
-        let idle_stream = counter.clone().idle_stream();
-        let conn_close = {
-            let conn = connection.clone();
-            async move { conn.closed().await }
-        };
-
-        tokio::pin!(idle_timer, idle_stream, conn_close);
-
-        loop {
-            tokio::select! {
-                biased;
-
-                handler = rx.recv() => {
-                    match handler {
-                        Some(RequestRef { id, tx }) => {
-                            assert!(id == node_id, "Not for me!");
-                            let res = ConnectionRef::new(connection.clone(), counter.get_one());
-                            info!(%node_id, "Handing out ConnectionRef {}", counter.current());
-                            idle_timer.as_mut().set_none();
-                            tx.send(Ok(res)).ok();
-                        }
-                        None => break,
-                    }
-                }
-
-                _ = &mut conn_close => break,
-
-                _ = idle_stream.next() => {
-                    if !counter.is_idle() {
-                        continue;
-                    };
-                    trace!(%node_id, "Idle");
-                    context.owner.try_idle(node_id);
-                    idle_timer
-                        .as_mut()
-                        .set_future(n0_future::time::sleep(context.options.idle_timeout));
-                }
-
-                _ = &mut idle_timer => {
-                    trace!(%node_id, "Idle timer expired, exiting");
-                    break;
-                }
-            }
-        }
-
-        let reason = if counter.is_idle() { b"idle" } else { b"drop" };
-        connection.close(0u32.into(), reason);
-        // Best-effort eager cleanup; the pool also detects our exit lazily
-        // via Err on the next conn_tx.send, so a dropped notification is
-        // not a correctness issue.
-        let _ = context
-            .owner
-            .tx
-            .try_send(ActorMessage::ConnectionShutdown { id: node_id });
-
-        trace!(%node_id, "Connection actor shutting down");
-    }
-}
-
-/// One per-connection-actor entry held by the pool's main loop.
-struct ConnectionEntry {
-    tx: mpsc::Sender<RequestRef>,
-    /// Held for `AbortOnDropHandle` drop semantics — never read.
-    _task: AbortOnDropHandle<()>,
-}
+type ConnectResult = (EndpointId, u64, Result<Connection, PoolConnectError>);
 
 struct Actor {
+    /// Inbox
     rx: mpsc::Receiver<ActorMessage>,
-    connections: HashMap<EndpointId, ConnectionEntry>,
-    context: Arc<Context>,
-    // idle set (most recent last)
-    // todo: use a better data structure if this becomes a performance issue
-    idle: VecDeque<EndpointId>,
+    /// Separate inbox for unused events, gets processed before the main inbox.
+    unused_rx: mpsc::UnboundedReceiver<EndpointId>,
+    /// Sender for the unused inbox to be cloned into the connection counter.
+    ///
+    /// This is unbounded so it can be used in Drop, but it is bounded by the number
+    /// of ConnectionRefs we give out, which is bounded by max_connections.
+    unused_tx: mpsc::UnboundedSender<EndpointId>,
+    options: Options,
+    endpoint: Endpoint,
+    alpn: Arc<[u8]>,
+    peers: HashMap<EndpointId, PeerState>,
+    /// Futures for currently connecting peers.
+    connecting: FuturesUnordered<Boxed<ConnectResult>>,
+    /// Generation counter used to distinguish between connection attempts to the same peer.
+    next_generation: u64,
+    /// Futures for connection close watchers.
+    conn_close: FuturesUnordered<Boxed<EndpointId>>,
+    /// Futures for cleaning up unused connections after the unused timeout.
+    unused_timers: FuturesUnordered<Boxed<EndpointId>>,
+    /// Currently unused connections, in order of when they became unused.
+    unused: VecDeque<EndpointId>,
 }
 
 impl Actor {
-    pub fn new(
+    fn new(
         endpoint: Endpoint,
         alpn: &[u8],
         options: Options,
     ) -> (Self, mpsc::Sender<ActorMessage>) {
-        let (tx, rx) = mpsc::channel(100);
+        let (tx, rx) = mpsc::channel(INBOX_CAPACITY);
+        let (unused_tx, unused_rx) = mpsc::unbounded_channel();
         (
             Self {
                 rx,
-                connections: HashMap::new(),
-                idle: VecDeque::new(),
-                context: Arc::new(Context {
-                    options,
-                    alpn: alpn.to_vec(),
-                    endpoint,
-                    owner: ConnectionPool { tx: tx.clone() },
-                }),
+                unused_rx,
+                unused_tx,
+                options,
+                endpoint,
+                alpn: alpn.to_vec().into(),
+                peers: HashMap::new(),
+                connecting: FuturesUnordered::new(),
+                next_generation: 0,
+                conn_close: FuturesUnordered::new(),
+                unused_timers: FuturesUnordered::new(),
+                unused: VecDeque::new(),
             },
             tx,
         )
     }
 
-    fn add_idle(&mut self, id: EndpointId) {
-        self.remove_idle(id);
-        self.idle.push_back(id);
-    }
+    async fn run(mut self) {
+        // We bias processing internal events before accepting more work from
+        // the external mailbox.
+        loop {
+            tokio::select! {
+                biased;
 
-    fn remove_idle(&mut self, id: EndpointId) {
-        self.idle.retain(|&x| x != id);
-    }
+                // Handle unused events first, since this might give us some room.
+                Some(id) = self.unused_rx.recv() => {
+                    self.handle_unused_event(id);
+                }
 
-    fn pop_oldest_idle(&mut self) -> Option<EndpointId> {
-        self.idle.pop_front()
-    }
+                Some((id, generation, result)) = self.connecting.next(), if !self.connecting.is_empty() => {
+                    self.handle_connect_result(id, generation, result);
+                }
 
-    fn remove_connection(&mut self, id: EndpointId) {
-        self.connections.remove(&id);
-        self.remove_idle(id);
-    }
+                Some(id) = self.conn_close.next(), if !self.conn_close.is_empty() => {
+                    trace!(%id, "connection closed by peer");
+                    self.remove_peer(id);
+                }
 
-    async fn handle_msg(&mut self, msg: ActorMessage) {
-        match msg {
-            ActorMessage::RequestRef(mut msg) => {
-                let id = msg.id;
-                self.remove_idle(id);
-                // Try to send to existing connection actor
-                if let Some(entry) = self.connections.get(&id) {
-                    if let Err(TokioSendError(e)) = entry.tx.send(msg).await {
-                        msg = e;
+                Some(id) = self.unused_timers.next(), if !self.unused_timers.is_empty() => {
+                    self.handle_unused_timer(id);
+                }
+
+                msg = self.rx.recv() => {
+                    let Some(msg) = msg else { break };
+                    self.handle_msg(msg);
+                }
+            }
+        }
+
+        // Notify waiters during shutdown and close connections.
+        for (_, state) in self.peers.drain() {
+            match state {
+                PeerState::Connecting { waiters, .. } => {
+                    for tx in waiters {
+                        let _ = tx.send(Err(e!(PoolConnectError::Shutdown)));
+                    }
+                }
+                PeerState::Ready {
+                    connection,
+                    counter,
+                    ..
+                } => {
+                    let reason: &[u8] = if counter.is_unused() {
+                        b"unused"
                     } else {
-                        return;
-                    }
-                    // Connection actor died, remove it
-                    self.remove_connection(id);
+                        b"drop"
+                    };
+                    connection.close(0u32.into(), reason);
                 }
-
-                // No connection actor or it died - check limits.
-                //
-                // We reap closed entries here (cap-check) but not on every
-                // dispatch: that bounds the cost to O(connections) per
-                // capacity miss instead of per RequestRef. Below the cap
-                // a stale entry survives until the next request for the
-                // same id (which fails fast on `conn_tx.send` and removes
-                // it). `connections.len()` therefore inflates by stale
-                // entries below the cap; if a future caller needs a
-                // truthful count for metrics, reaping should move higher
-                // up in `handle_msg`.
-                if self.connections.len() >= self.context.options.max_connections {
-                    self.connections.retain(|id, entry| {
-                        if entry.tx.is_closed() {
-                            self.idle.retain(|x| x != id);
-                            false
-                        } else {
-                            true
-                        }
-                    });
-                    if self.connections.len() >= self.context.options.max_connections {
-                        if let Some(idle) = self.pop_oldest_idle() {
-                            // remove the oldest idle connection to make room for one more
-                            trace!("removing oldest idle connection {}", idle);
-                            self.connections.remove(&idle);
-                        } else {
-                            msg.tx
-                                .send(Err(e!(PoolConnectError::TooManyConnections)))
-                                .ok();
-                            return;
-                        }
-                    }
-                }
-                let (conn_tx, conn_rx) = mpsc::channel(PER_CONNECTION_INBOX);
-                let context = self.context.clone();
-                // Connection actors run on their own task so their
-                // `endpoint.connect`/`connect_timeout` make progress
-                // independently of the pool main loop.
-                let task = AbortOnDropHandle::new(n0_future::task::spawn(
-                    context.run_connection_actor(id, conn_rx),
-                ));
-                self.connections.insert(
-                    id,
-                    ConnectionEntry {
-                        tx: conn_tx.clone(),
-                        _task: task,
-                    },
-                );
-
-                // Send the handler to the new actor
-                if conn_tx.send(msg).await.is_err() {
-                    error!(%id, "Failed to send handler to new connection actor");
-                    self.connections.remove(&id);
-                }
-            }
-            ActorMessage::ConnectionIdle { id } => {
-                self.add_idle(id);
-                trace!(%id, "connection idle");
-            }
-            ActorMessage::ConnectionShutdown { id } => {
-                // Remove the connection from our map - this closes the channel
-                self.remove_connection(id);
-                trace!(%id, "removed connection");
             }
         }
     }
 
-    pub async fn run(mut self) {
-        while let Some(msg) = self.rx.recv().await {
-            self.handle_msg(msg).await;
+    fn handle_msg(&mut self, msg: ActorMessage) {
+        match msg {
+            ActorMessage::RequestRef(req) => self.handle_request(req),
+            ActorMessage::ConnectionShutdown { id } => {
+                trace!(%id, "shutdown requested");
+                self.remove_peer(id);
+            }
+        }
+    }
+
+    fn handle_request(&mut self, req: RequestRef) {
+        let id = req.id;
+        // Remove the id from the unused list,
+        self.unused.retain(|x| *x != id);
+
+        if let Some(state) = self.peers.get_mut(&id) {
+            match state {
+                PeerState::Connecting { waiters, .. } => {
+                    waiters.push(req.tx);
+                    return;
+                }
+                PeerState::Ready {
+                    connection,
+                    counter,
+                    unused_since,
+                } => {
+                    *unused_since = None;
+                    let one = counter.get_one();
+                    info!(%id, "Handing out ConnectionRef {}", counter.current());
+                    let _ = req.tx.send(Ok(ConnectionRef::new(connection.clone(), one)));
+                    return;
+                }
+            }
+        }
+
+        // If we exceed max_connections, do a last attempt to make room, otherwise fail.
+        if self.peers.len() >= self.options.max_connections {
+            if let Some(id) = self.unused.pop_front() {
+                trace!("evicting oldest unused peer {id} to make room");
+                self.remove_peer_inner(id);
+            } else {
+                let _ = req.tx.send(Err(e!(PoolConnectError::TooManyConnections)));
+                return;
+            }
+        }
+
+        let generation = self.next_generation;
+        self.next_generation += 1;
+        self.peers.insert(
+            id,
+            PeerState::Connecting {
+                generation,
+                waiters: vec![req.tx],
+            },
+        );
+        self.connecting
+            .push(self.make_connect_future(id, generation));
+    }
+
+    fn make_connect_future(&self, id: EndpointId, generation: u64) -> Boxed<ConnectResult> {
+        let endpoint = self.endpoint.clone();
+        let alpn = self.alpn.clone();
+        let on_connected = self.options.on_connected.clone();
+        let connect_timeout = self.options.connect_timeout;
+        Box::pin(async move {
+            let attempt = async {
+                let conn = endpoint
+                    .connect(id, &alpn[..])
+                    .await
+                    .map_err(PoolConnectError::from)?;
+                if let Some(f) = &on_connected {
+                    f(&endpoint, &conn).await.map_err(PoolConnectError::from)?;
+                }
+                Result::<Connection, PoolConnectError>::Ok(conn)
+            };
+            let result = match n0_future::time::timeout(connect_timeout, attempt).await {
+                Ok(r) => r,
+                Err(_) => Err(e!(PoolConnectError::Timeout)),
+            };
+            (id, generation, result)
+        })
+    }
+
+    fn handle_connect_result(
+        &mut self,
+        id: EndpointId,
+        generation: u64,
+        result: Result<Connection, PoolConnectError>,
+    ) {
+        let current = matches!(
+            self.peers.get(&id),
+            Some(PeerState::Connecting { generation: g, .. }) if *g == generation
+        );
+        if !current {
+            // PeerState was removed or changed in the meantime, discard the connection.
+            debug!(%id, "stale connect result, discarding");
+            if let Ok(conn) = result {
+                conn.close(0u32.into(), b"discarded");
+            }
+            return;
+        }
+        let Some(PeerState::Connecting { waiters, .. }) = self.peers.remove(&id) else {
+            return;
+        };
+        match result {
+            Ok(conn) => {
+                let counter = ConnectionCounter::new(id, self.unused_tx.clone());
+                for tx in waiters {
+                    if tx.is_closed() {
+                        continue;
+                    }
+                    let one = counter.get_one();
+                    if tx.send(Ok(ConnectionRef::new(conn.clone(), one))).is_err() {
+                        // User is no longer interested in the ConnectionRef.
+                    }
+                }
+                info!(%id, "connected, {} ref(s) outstanding", counter.current());
+
+                // Create a future that waits for the connection to close.
+                let close_fut: Boxed<EndpointId> = {
+                    let conn = conn.clone();
+                    Box::pin(async move {
+                        conn.closed().await;
+                        id
+                    })
+                };
+                self.conn_close.push(close_fut);
+
+                let unused_since = if counter.is_unused() {
+                    // Schedule an idle timer if it is already unused here.
+                    self.unused.push_back(id);
+                    self.schedule_unused_timer(id);
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                self.peers.insert(
+                    id,
+                    PeerState::Ready {
+                        connection: conn,
+                        counter,
+                        unused_since,
+                    },
+                );
+            }
+            Err(cause) => {
+                debug!(%id, "connect failed: {cause:?}");
+                for tx in waiters {
+                    let _ = tx.send(Err(cause.clone()));
+                }
+            }
+        }
+    }
+
+    fn handle_unused_event(&mut self, id: EndpointId) {
+        let Some(PeerState::Ready {
+            counter,
+            unused_since,
+            ..
+        }) = self.peers.get_mut(&id)
+        else {
+            return;
+        };
+        // Connection was handed out in the meantime.
+        if !counter.is_unused() {
+            return;
+        }
+        *unused_since = Some(Instant::now());
+        self.unused.retain(|x| *x != id);
+        self.unused.push_back(id);
+        trace!(%id, "peer unused");
+        self.schedule_unused_timer(id);
+    }
+
+    fn schedule_unused_timer(&mut self, id: EndpointId) {
+        let timeout = self.options.idle_timeout;
+        let timer: Boxed<EndpointId> = Box::pin(async move {
+            n0_future::time::sleep(timeout).await;
+            id
+        });
+        self.unused_timers.push(timer);
+    }
+
+    fn handle_unused_timer(&mut self, id: EndpointId) {
+        let Some(PeerState::Ready {
+            counter,
+            unused_since,
+            ..
+        }) = self.peers.get(&id)
+        else {
+            // PeerState is no longer what we expect. Either mising entirely
+            // or Connecting. In either case, we must not do anything.
+            return;
+        };
+        if !counter.is_unused() {
+            return;
+        }
+        let Some(since) = unused_since else { return };
+        if since.elapsed() >= self.options.idle_timeout {
+            trace!(%id, "unused timeout, removing");
+            self.remove_peer_inner(id);
+        }
+    }
+
+    fn remove_peer(&mut self, id: EndpointId) {
+        self.remove_peer_inner(id);
+    }
+
+    fn remove_peer_inner(&mut self, id: EndpointId) {
+        self.unused.retain(|x| *x != id);
+        if let Some(state) = self.peers.remove(&id) {
+            match state {
+                PeerState::Connecting { waiters, .. } => {
+                    for tx in waiters {
+                        let _ = tx.send(Err(e!(PoolConnectError::Shutdown)));
+                    }
+                }
+                PeerState::Ready {
+                    connection,
+                    counter,
+                    ..
+                } => {
+                    let reason: &[u8] = if counter.is_unused() {
+                        b"unused"
+                    } else {
+                        b"drop"
+                    };
+                    connection.close(0u32.into(), reason);
+                }
+            }
         }
     }
 }
@@ -447,10 +535,7 @@ pub struct ConnectionPool {
 impl ConnectionPool {
     pub fn new(endpoint: Endpoint, alpn: &[u8], options: Options) -> Self {
         let (actor, tx) = Actor::new(endpoint, alpn, options);
-
-        // Spawn the main actor
         n0_future::task::spawn(actor.run());
-
         Self { tx }
     }
 
@@ -481,20 +566,13 @@ impl ConnectionPool {
             .map_err(|_| e!(ConnectionPoolError::Shutdown))?;
         Ok(())
     }
-
-    /// Best-effort idle notification (LRU tracking). Cannot await on the
-    /// pool inbox: that would deadlock against the pool's own
-    /// `conn_tx.send().await` dispatch when the per-connection inbox is
-    /// full. Dropped notifications only stale the LRU order.
-    pub(crate) fn try_idle(&self, id: EndpointId) {
-        let _ = self.tx.try_send(ActorMessage::ConnectionIdle { id });
-    }
 }
 
 #[derive(Debug)]
 struct ConnectionCounterInner {
     count: AtomicUsize,
-    notify: Notify,
+    id: EndpointId,
+    unused_tx: mpsc::UnboundedSender<EndpointId>,
 }
 
 #[derive(Debug, Clone)]
@@ -503,11 +581,12 @@ struct ConnectionCounter {
 }
 
 impl ConnectionCounter {
-    fn new() -> Self {
+    fn new(id: EndpointId, unused_tx: mpsc::UnboundedSender<EndpointId>) -> Self {
         Self {
             inner: Arc::new(ConnectionCounterInner {
-                count: Default::default(),
-                notify: Notify::new(),
+                count: AtomicUsize::new(0),
+                id,
+                unused_tx,
             }),
         }
     }
@@ -516,35 +595,19 @@ impl ConnectionCounter {
         self.inner.count.load(Ordering::SeqCst)
     }
 
-    /// Increase the connection count and return a guard for the new connection
+    fn is_unused(&self) -> bool {
+        self.current() == 0
+    }
+
     fn get_one(&self) -> OneConnection {
         self.inner.count.fetch_add(1, Ordering::SeqCst);
         OneConnection {
             inner: self.inner.clone(),
         }
     }
-
-    fn is_idle(&self) -> bool {
-        self.inner.count.load(Ordering::SeqCst) == 0
-    }
-
-    /// Infinite stream that yields when the connection is briefly idle.
-    ///
-    /// Note that you still have to check if the connection is still idle when
-    /// you get the notification.
-    ///
-    /// Also note that this stream is triggered on [OneConnection::drop], so it
-    /// won't trigger initially even though a [ConnectionCounter] starts up as
-    /// idle.
-    fn idle_stream(self) -> impl Stream<Item = ()> {
-        n0_future::stream::unfold(self, |c| async move {
-            c.inner.notify.notified().await;
-            Some(((), c))
-        })
-    }
 }
 
-/// Guard for one connection
+/// Handle to a connection counter that decrements it on drop.
 #[derive(Debug)]
 struct OneConnection {
     inner: Arc<ConnectionCounterInner>,
@@ -553,7 +616,8 @@ struct OneConnection {
 impl Drop for OneConnection {
     fn drop(&mut self) {
         if self.inner.count.fetch_sub(1, Ordering::SeqCst) == 1 {
-            self.inner.notify.notify_waiters();
+            // Send an unused event to the actor.
+            let _ = self.inner.unused_tx.send(self.inner.id);
         }
     }
 }
@@ -678,9 +742,7 @@ mod tests {
     }
 
     #[tokio::test]
-    // #[traced_test]
     async fn connection_pool_errors() -> TestResult<()> {
-        // set up static address lookup for all addrs
         let address_lookup = MemoryLookup::new();
         let endpoint = iroh::Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Default)
@@ -692,21 +754,16 @@ mod tests {
         {
             let non_existing = SecretKey::from_bytes(&[0; 32]).public();
             let res = client.echo(non_existing, b"Hello, world!".to_vec()).await;
-            // trying to connect to a non-existing id will fail with ConnectError
-            // because we don't have any information about the endpoint.
             assert!(matches!(res, Err(PoolConnectError::ConnectError { .. })));
         }
         {
             let non_listening = SecretKey::from_bytes(&[0; 32]).public();
-            // make up fake node info
             address_lookup.add_endpoint_info(EndpointAddr {
                 id: non_listening,
                 addrs: vec![TransportAddr::Ip("127.0.0.1:12121".parse().unwrap())]
                     .into_iter()
                     .collect(),
             });
-            // trying to connect to an id for which we have info, but the other
-            // end is not listening, will lead to a timeout.
             let res = client.echo(non_listening, b"Hello, world!".to_vec()).await;
             assert!(matches!(res, Err(PoolConnectError::Timeout { .. })));
         }
@@ -715,11 +772,9 @@ mod tests {
     }
 
     #[tokio::test]
-    // #[traced_test]
     async fn connection_pool_smoke() -> TestResult<()> {
         let n = 32;
         let (ids, routers, address_lookup) = echo_servers(n).await?;
-        // build a client endpoint that can resolve all the endpoint ids
         let endpoint = iroh::Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Default)
             .address_lookup(address_lookup.clone())
@@ -749,14 +804,12 @@ mod tests {
         Ok(())
     }
 
-    /// Tests that idle connections are being reclaimed to make room if we hit the
+    /// Tests that unused connections are being reclaimed to make room if we hit the
     /// maximum connection limit.
     #[tokio::test]
-    // #[traced_test]
-    async fn connection_pool_idle() -> TestResult<()> {
+    async fn connection_pool_unused() -> TestResult<()> {
         let n = 32;
         let (ids, routers, address_lookup) = echo_servers(n).await?;
-        // build a client endpoint that can resolve all the endpoint ids
         let endpoint = iroh::Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Default)
             .address_lookup(address_lookup.clone())
@@ -783,10 +836,7 @@ mod tests {
     }
 
     /// Uses an on_connected callback that just errors out every time.
-    ///
-    /// This is a basic smoke test that on_connected gets called at all.
     #[tokio::test]
-    // #[traced_test]
     async fn on_connected_error() -> TestResult<()> {
         let n = 1;
         let (ids, routers, address_lookup) = echo_servers(n).await?;
@@ -818,7 +868,6 @@ mod tests {
 
     /// Uses an on_connected callback to ensure that the connection is direct.
     #[tokio::test]
-    // #[traced_test]
     async fn on_connected_direct() -> TestResult<()> {
         let n = 1;
         let (ids, routers, address_lookup) = echo_servers(n).await?;
@@ -862,16 +911,8 @@ mod tests {
         Ok((sock, addr))
     }
 
-    /// Spawn `n` concurrent `get_or_connect(id)` calls and yield until
-    /// each task has at least entered its body (counter increment).
-    ///
-    /// The increment runs *before* `pool.get_or_connect(id).await`, so
-    /// strictly speaking this only proves all `n` tasks are executing,
-    /// not that they have all reached `pool.tx.send().await`. On the
-    /// cooperative current-thread runtime these tests use, the resume
-    /// after the final `yield_now` does in practice run every spawned
-    /// task to its first await — but that is a runtime property, not a
-    /// guarantee of this helper.
+    /// Spawn `n` concurrent `get_or_connect(id)` calls and yield until each
+    /// task has at least entered its body.
     async fn enter_get_or_connect(
         pool: ConnectionPool,
         id: EndpointId,
@@ -932,14 +973,8 @@ mod tests {
             },
         );
 
-        // Concurrency above the per-connection inbox capacity is what
-        // forces the dispatch wedge.
-        let backlog =
-            enter_get_or_connect(pool.clone(), dead_peer, super::PER_CONNECTION_INBOX + 50).await;
+        let backlog = enter_get_or_connect(pool.clone(), dead_peer, 150).await;
 
-        // With the fix the probe completes in ~one connect_timeout
-        // window; without the fix it hangs. 5x leaves slack for a loaded
-        // CI runner without delaying the regression failure.
         let probe_budget = connect_timeout * 5;
         let probe = Instant::now();
         let probe_result =
@@ -994,8 +1029,7 @@ mod tests {
             },
         );
 
-        let backlog =
-            enter_get_or_connect(pool.clone(), dead_peer, super::PER_CONNECTION_INBOX / 2).await;
+        let backlog = enter_get_or_connect(pool.clone(), dead_peer, 50).await;
 
         let probe = Instant::now();
         let res = pool.get_or_connect(live_peer).await;
@@ -1003,7 +1037,7 @@ mod tests {
         assert!(res.is_ok(), "live-peer connect failed: {res:?}");
         assert!(
             elapsed < connect_timeout,
-            "live-peer probe took {elapsed:?} below inbox cap"
+            "live-peer probe took {elapsed:?}"
         );
 
         for h in backlog {
@@ -1014,12 +1048,52 @@ mod tests {
         Ok(())
     }
 
+    /// Regression test for a bug when you closed a slow connection attempt and then tried to connect again.
+    /// You would sometimes get the old connection attempt.
+    #[tokio::test]
+    async fn stale_connect_result_is_discarded() -> TestResult<()> {
+        let (ids, routers, address_lookup) = echo_servers(1).await?;
+        let id = ids[0];
+        let endpoint = iroh::Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Default)
+            .address_lookup(address_lookup)
+            .bind()
+            .await?;
+        let handshake = Duration::from_millis(1000);
+        let pool = ConnectionPool::new(
+            endpoint.clone(),
+            ECHO_ALPN,
+            test_options().with_on_connected(move |_, _| async move {
+                n0_future::time::sleep(handshake).await;
+                Ok(())
+            }),
+        );
+        let first = {
+            let pool = pool.clone();
+            n0_future::task::spawn(async move { pool.get_or_connect(id).await })
+        };
+        n0_future::time::sleep(Duration::from_millis(800)).await;
+        pool.close(id).await.expect("close failed");
+        n0_future::time::sleep(Duration::from_millis(10)).await;
+        let t = std::time::Instant::now();
+        let second = pool.get_or_connect(id).await;
+        let elapsed = t.elapsed();
+        let first = first.await.expect("join failed");
+        assert!(matches!(first, Err(PoolConnectError::Shutdown { .. })));
+        assert!(second.is_ok(), "second connect failed: {second:?}");
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "second connect completed in {elapsed:?}, served by a stale connect attempt"
+        );
+        drop(second);
+        shutdown_routers(routers).await;
+        endpoint.close().await;
+        Ok(())
+    }
+
     /// Check that when a connection is closed, the pool will give you a new
     /// connection next time you want one.
-    ///
-    /// This test fails if the connection watch is disabled.
     #[tokio::test]
-    // #[traced_test]
     async fn watch_close() -> TestResult<()> {
         let n = 1;
         let (ids, routers, address_lookup) = echo_servers(n).await?;
