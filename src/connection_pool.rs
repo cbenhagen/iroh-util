@@ -33,7 +33,7 @@ use tracing::{debug, info, trace};
 pub type OnConnected =
     Arc<dyn Fn(&Endpoint, &Connection) -> n0_future::future::Boxed<io::Result<()>> + Send + Sync>;
 
-/// We now have just a single actor, so we can afford a larger inbox.
+/// The pool is a single actor, so we can afford a larger inbox.
 const INBOX_CAPACITY: usize = 1024;
 
 /// Configuration options for the connection pool
@@ -116,6 +116,8 @@ pub enum PoolConnectError {
     /// Connection pool is shut down
     #[error("Connection pool is shut down")]
     Shutdown {},
+    #[error("Connection was closed")]
+    Closed {},
     /// Timeout during connect
     #[error("Timeout during connect")]
     Timeout {},
@@ -506,7 +508,7 @@ impl Actor {
             match state {
                 PeerState::Connecting { waiters, .. } => {
                     for tx in waiters {
-                        let _ = tx.send(Err(e!(PoolConnectError::Shutdown)));
+                        let _ = tx.send(Err(e!(PoolConnectError::Closed)));
                     }
                 }
                 PeerState::Ready {
@@ -937,12 +939,9 @@ mod tests {
         handles
     }
 
-    /// Regression for a deadlock between the pool main loop and a
-    /// per-connection actor when concurrent requests for one slow-to-
-    /// connect peer overflow the per-connection inbox: the pool blocked
-    /// on `conn_tx.send().await` while the actor's error path blocked on
-    /// `owner.close().await` into the also-full pool main inbox. Probe
-    /// against an unrelated reachable peer must complete in bounded time.
+    /// Concurrent get_or_connect calls for an unreachable peer must not
+    /// prevent a probe against an unrelated reachable peer from completing
+    /// in bounded time.
     #[tokio::test]
     async fn connection_pool_dead_peer_backlog_does_not_wedge() -> TestResult<()> {
         use std::time::Instant;
@@ -996,10 +995,9 @@ mod tests {
         }
     }
 
-    /// Boundary check for `connection_pool_dead_peer_backlog_does_not_wedge`:
-    /// concurrency below the per-connection inbox capacity does not trigger
-    /// the wedge, so the unrelated-peer probe must complete within one
-    /// `connect_timeout` window.
+    /// Same setup as `connection_pool_dead_peer_backlog_does_not_wedge`,
+    /// with concurrency below the inbox capacity. The unrelated-peer probe
+    /// must complete within one `connect_timeout` window.
     #[tokio::test]
     async fn connection_pool_dead_peer_below_inbox_cap_is_unaffected() -> TestResult<()> {
         use std::time::Instant;
@@ -1048,8 +1046,102 @@ mod tests {
         Ok(())
     }
 
-    /// Regression test for a bug when you closed a slow connection attempt and then tried to connect again.
-    /// You would sometimes get the old connection attempt.
+    #[tokio::test]
+    async fn close_during_connect_returns_closed() -> TestResult<()> {
+        let (ids, routers, address_lookup) = echo_servers(1).await?;
+        let id = ids[0];
+        let endpoint = iroh::Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Default)
+            .address_lookup(address_lookup)
+            .bind()
+            .await?;
+        let handshake = Duration::from_millis(1000);
+        let pool = ConnectionPool::new(
+            endpoint.clone(),
+            ECHO_ALPN,
+            test_options().with_on_connected(move |_, _| async move {
+                n0_future::time::sleep(handshake).await;
+                Ok(())
+            }),
+        );
+        let first = {
+            let pool = pool.clone();
+            n0_future::task::spawn(async move { pool.get_or_connect(id).await })
+        };
+        n0_future::time::sleep(Duration::from_millis(800)).await;
+        pool.close(id).await.expect("close failed");
+        let first = first.await.expect("join failed");
+        assert!(
+            matches!(first, Err(PoolConnectError::Closed { .. })),
+            "in-flight connect after close: {first:?}"
+        );
+        let second = pool.get_or_connect(id).await;
+        assert!(second.is_ok(), "pool unusable after close: {second:?}");
+        drop(second);
+        shutdown_routers(routers).await;
+        endpoint.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn close_then_immediate_reconnect() -> TestResult<()> {
+        let (ids, routers, address_lookup) = echo_servers(1).await?;
+        let id = ids[0];
+        let endpoint = iroh::Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Default)
+            .address_lookup(address_lookup)
+            .bind()
+            .await?;
+        let pool = ConnectionPool::new(endpoint.clone(), ECHO_ALPN, test_options());
+        let conn1 = pool.get_or_connect(id).await?;
+        let cid1 = conn1.stable_id();
+        pool.close(id).await.expect("close failed");
+        let conn2 = pool
+            .get_or_connect(id)
+            .await
+            .unwrap_or_else(|e| panic!("reconnect after close failed: {e:?}"));
+        assert_ne!(conn2.stable_id(), cid1);
+        let msg = b"after close";
+        assert_eq!(echo_client(&conn2, msg).await?, msg);
+        drop(conn1);
+        drop(conn2);
+        shutdown_routers(routers).await;
+        endpoint.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropping_old_ref_does_not_close_new_connection() -> TestResult<()> {
+        let (ids, routers, address_lookup) = echo_servers(1).await?;
+        let id = ids[0];
+        let endpoint = iroh::Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Default)
+            .address_lookup(address_lookup)
+            .bind()
+            .await?;
+        let pool = ConnectionPool::new(
+            endpoint.clone(),
+            ECHO_ALPN,
+            Options {
+                idle_timeout: Duration::from_millis(50),
+                ..test_options()
+            },
+        );
+        let conn1 = pool.get_or_connect(id).await?;
+        pool.close(id).await.expect("close failed");
+        let conn2 = pool.get_or_connect(id).await?;
+        drop(conn1);
+        n0_future::time::sleep(Duration::from_millis(200)).await;
+        let msg = b"still alive";
+        assert_eq!(echo_client(&conn2, msg).await?, msg);
+        drop(conn2);
+        shutdown_routers(routers).await;
+        endpoint.close().await;
+        Ok(())
+    }
+
+    /// Closing a slow connection attempt discards it. A later connect starts
+    /// a new attempt.
     #[tokio::test]
     async fn stale_connect_result_is_discarded() -> TestResult<()> {
         let (ids, routers, address_lookup) = echo_servers(1).await?;
@@ -1079,7 +1171,7 @@ mod tests {
         let second = pool.get_or_connect(id).await;
         let elapsed = t.elapsed();
         let first = first.await.expect("join failed");
-        assert!(matches!(first, Err(PoolConnectError::Shutdown { .. })));
+        assert!(matches!(first, Err(PoolConnectError::Closed { .. })));
         assert!(second.is_ok(), "second connect failed: {second:?}");
         assert!(
             elapsed >= Duration::from_millis(900),
